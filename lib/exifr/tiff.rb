@@ -1,4 +1,4 @@
-# Copyright (c) 2007, 2008, 2009, 2010, 2011 - R.W. van 't Veer
+# Copyright (c) 2007-2017 - R.W. van 't Veer
 
 require 'exifr'
 require 'rational'
@@ -169,7 +169,7 @@ module EXIFR
         0x927c => :maker_note,
         0x9286 => :user_comment,
         0x9290 => :subsec_time,
-        0x9291 => :subsec_time_orginal,
+        0x9291 => :subsec_time_original,
         0x9292 => :subsec_time_digitized,
         0xa000 => :flashpix_version,
         0xa001 => :color_space,
@@ -199,7 +199,10 @@ module EXIFR
         0xa40a => :sharpness,
         0xa40b => :device_setting_description,
         0xa40c => :subject_distance_range,
-        0xa420 => :image_unique_id
+        0xa420 => :image_unique_id,
+        0xa433 => :lens_make,
+        0xa434 => :lens_model,
+        0xa435 => :lens_serial_number
       },
 
       :gps => {
@@ -234,16 +237,28 @@ module EXIFR
         0x001c => :gps_area_information,
         0x001d => :gps_date_stamp,
         0x001e => :gps_differential,
+        0x001f => :gps_h_positioning_error
       },
     })
     IFD_TAGS = [:image, :exif, :gps] # :nodoc:
 
+    class << self
+      # Callable to create a +Time+ object.  Defaults to <tt>proc{|*a|Time.local(*a)}</tt>.
+      attr_accessor :mktime_proc
+    end
+    self.mktime_proc = proc { |*args| Time.local(*args) }
+
     time_proc = proc do |value|
-      value.map do |value|
-        if value =~ /^(\d{4}):(\d\d):(\d\d) (\d\d):(\d\d):(\d\d)$/
-          Time.mktime($1.to_i, $2.to_i, $3.to_i, $4.to_i, $5.to_i, $6.to_i) rescue nil
+      value.map do |v|
+        if v =~ /^(\d{4}):(\d\d):(\d\d) (\d\d):(\d\d):(\d\d)(?:\.(\d{3}))?$/
+          begin
+            mktime_proc.call($1.to_i, $2.to_i, $3.to_i, $4.to_i, $5.to_i, $6.to_i, $7.to_i * 1000)
+          rescue => ex
+            EXIFR.logger.warn("Bad date/time value #{v.inspect}: #{ex}")
+            nil
+          end
         else
-          value
+          v
         end
       end
     end
@@ -257,6 +272,11 @@ module EXIFR
       # Field value.
       def to_i
         @value
+      end
+
+      # Symbolic value.
+      def to_sym
+        @type
       end
 
       # Debugging output.
@@ -300,9 +320,20 @@ module EXIFR
       const_set("#{type}Orientation", ORIENTATIONS[index] = Orientation.new(index, type))
     end
 
+    degrees_proc = proc do |v|
+      begin
+        Degrees.new(v)
+      rescue => ex
+        EXIFR.logger.warn("malformed GPS degrees: #{ex}")
+        nil
+      end
+    end
+
     class Degrees < Array
       def initialize(arr)
-        raise MalformedTIFF, "expected [degrees, minutes, seconds]" unless arr.length == 3
+        unless arr.length == 3 && arr.all?{|v| Rational === v}
+          raise "expected [degrees, minutes, seconds]; got #{arr.inspect}"
+        end
         super
       end
 
@@ -312,7 +343,13 @@ module EXIFR
     end
 
     def self.rational(n, d)
-      Rational.respond_to?(:reduce) ? Rational.reduce(n, d) : 1.quo(d)
+      if d == 0
+        n.to_f / d.to_f
+      elsif Rational.respond_to?(:reduce)
+        Rational.reduce(n, d)
+      else
+        n.quo(d)
+      end
     end
 
     def self.round(f, n)
@@ -325,19 +362,19 @@ module EXIFR
                       :date_time_original => time_proc,
                       :date_time_digitized => time_proc,
                       :date_time => time_proc,
-                      :orientation => proc { |v| v.map{|v| ORIENTATIONS[v]} },
-                      :gps_latitude => proc { |v| Degrees.new(v) },
-                      :gps_longitude => proc { |v| Degrees.new(v) },
-                      :gps_dest_latitude => proc { |v| Degrees.new(v) },
-                      :gps_dest_longitude => proc { |v| Degrees.new(v) },
-                      :shutter_speed_value => proc { |v| v.map { |v| v.abs < 100 ? rational(1, (2 ** v).to_i) : nil } },
-                      :aperture_value => proc { |v| v.map { |v| round(1.4142 ** v, 1) } }
+                      :orientation => proc { |x| x.map{|y| ORIENTATIONS[y]} },
+                      :gps_latitude => degrees_proc,
+                      :gps_longitude => degrees_proc,
+                      :gps_dest_latitude => degrees_proc,
+                      :gps_dest_longitude => degrees_proc,
+                      :shutter_speed_value => proc { |x| x.map { |y| y.abs < 100 ? rational(1, (2 ** y).to_i) : nil } },
+                      :aperture_value => proc { |x| x.map { |y| round(1.4142 ** y, 1) } }
                     })
 
     # Names for all recognized TIFF fields.
-    TAGS = ([TAG_MAPPING.keys, TAG_MAPPING.values.map{|v|v.values}].flatten.uniq - IFD_TAGS).map{|v|v.to_s}
+    TAGS = [TAG_MAPPING.keys, TAG_MAPPING.values.map{|v|v.values}].flatten.uniq - IFD_TAGS
 
-    # +file+ is a filename or an IO object.  Hint: use StringIO when working with slurped data like blobs.
+    # +file+ is a filename or an +IO+ object.  Hint: use +StringIO+ when working with slurped data like blobs.
     def initialize(file)
       Data.open(file) do |data|
         @ifds = [IFD.new(data)]
@@ -346,10 +383,15 @@ module EXIFR
           @ifds << ifd
         end
 
-        @jpeg_thumbnails = @ifds.map do |ifd|
-          if ifd.jpeg_interchange_format && ifd.jpeg_interchange_format_length
-            start, length = ifd.jpeg_interchange_format, ifd.jpeg_interchange_format_length
-            data[start..(start + length)]
+        @jpeg_thumbnails = @ifds.map do |v|
+          if v.jpeg_interchange_format && v.jpeg_interchange_format_length
+            start, length = v.jpeg_interchange_format, v.jpeg_interchange_format_length
+            if Integer === start && Integer === length
+              data[start..(start + length)]
+            else
+              EXIFR.logger.warn("Non numeric JpegInterchangeFormat data")
+              nil
+            end
           end
         end.compact
       end
@@ -376,21 +418,33 @@ module EXIFR
 
       if @ifds.first.respond_to?(method)
         @ifds.first.send(method)
-      elsif TAGS.include?(method.to_s)
+      elsif TAGS.include?(method)
         @ifds.first.to_hash[method]
       else
         super
       end
     end
 
-    def respond_to?(method) # :nodoc:
+    def respond_to?(method, include_all = false) # :nodoc:
       super ||
-        (defined?(@ifds) && @ifds && @ifds.first && @ifds.first.respond_to?(method)) ||
-        TAGS.include?(method.to_s)
+        (defined?(@ifds) && @ifds && @ifds.first && @ifds.first.respond_to?(method, include_all)) ||
+        TAGS.include?(method)
     end
 
-    def methods # :nodoc:
-      (super + TAGS + IFD.instance_methods(false)).uniq
+    def methods(regular=true) # :nodoc:
+      if regular
+        (super + TAGS + IFD.instance_methods(false)).uniq
+      else
+        super
+      end
+    end
+
+    def encode_with(coder)
+      coder["ifds"] = @ifds
+    end
+
+    def to_yaml_properties
+      ['@ifds']
     end
 
     class << self
@@ -414,9 +468,12 @@ module EXIFR
     # Get GPS location, altitude and image direction return nil when not available.
     def gps
       return nil unless gps_latitude && gps_longitude
+
+      altitude = gps_altitude.is_a?(Array) ? gps_altitude.first : gps_altitude
+
       GPS.new(gps_latitude.to_f * (gps_latitude_ref == 'S' ? -1 : 1),
               gps_longitude.to_f * (gps_longitude_ref == 'W' ? -1 : 1),
-              gps_altitude && (gps_altitude.to_f * (gps_altitude_ref == "\1" ? -1 : 1)),
+              altitude && (altitude.to_f * (gps_altitude_ref == "\1" ? -1 : 1)),
               gps_img_direction && gps_img_direction.to_f)
     end
 
@@ -432,20 +489,23 @@ module EXIFR
 
         pos = offset || @data.readlong(4)
         num = @data.readshort(pos)
-        pos += 2
 
-        num.times do
-          add_field(Field.new(@data, pos))
-          pos += 12
+        if pos && num
+          pos += 2
+
+          num.times do
+            add_field(Field.new(@data, pos))
+            pos += 12
+          end
+
+          @offset_next = @data.readlong(pos)
         end
-
-        @offset_next = @data.readlong(pos)
-      rescue
-        @offset_next = 0
+      rescue => ex
+        EXIFR.logger.warn("Badly formed IFD: #{ex}")
       end
 
       def method_missing(method, *args)
-        super unless args.empty? && TAGS.include?(method.to_s)
+        super unless args.empty? && TAGS.include?(method)
         to_hash[method]
       end
 
@@ -469,11 +529,15 @@ module EXIFR
       end
 
       def next?
-        @offset_next != 0 && @offset_next < @data.size
+        @offset_next && @offset_next > 0 && @offset_next < @data.size
       end
 
       def next
         IFD.new(@data, @offset_next) if next?
+      end
+
+      def encode_with(coder)
+        coder["fields"] = @fields
       end
 
       def to_yaml_properties
@@ -507,7 +571,7 @@ module EXIFR
         when 6 # signed byte
           len, pack = count, proc { |d| sign_byte(d) }
         when 2 # ascii
-          len, pack = count, proc { |d| d.unpack("A*") }
+          len, pack = count, proc { |d| d.unpack('Z*') }
         when 3 # short
           len, pack = count * 2, proc { |d| d.unpack(data.short + '*') }
         when 8 # signed short
@@ -540,6 +604,8 @@ module EXIFR
             end
             rationals
           end
+        else
+          return
         end
 
         if len && pack && @type != 7

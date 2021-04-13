@@ -1,31 +1,27 @@
 #!/usr/bin/env ruby
 #
-# Copyright (c) 2006, 2007, 2008, 2009, 2010, 2011 - R.W. van 't Veer
+# Copyright (c) 2006-2020 - R.W. van 't Veer
 
 require 'test_helper'
 
-class TIFFTest < Test::Unit::TestCase
+class TIFFTest < TestCase
   def setup
     @t = TIFF.new(f('nikon_d1x.tif'))
   end
 
   def test_initialize
     all_test_tiffs.each do |fname|
-      assert_nothing_raised do
-        TIFF.new(fname)
-      end
-      assert_nothing_raised do
-        open(fname) { |rd| TIFF.new(rd) }
-      end
-      assert_nothing_raised do
-        TIFF.new(StringIO.new(File.read(fname)))
-      end
+      assert TIFF.new(fname)
+      open(fname) { |rd| assert TIFF.new(rd) }
+      assert TIFF.new(StringIO.new(File.read(fname)))
     end
   end
-  
+
   def test_raises_malformed_tiff
-    assert_raise MalformedTIFF do
+    begin
       TIFF.new(StringIO.new("djibberish"))
+    rescue MalformedTIFF => ex
+      assert ex
     end
   end
 
@@ -59,10 +55,18 @@ class TIFFTest < Test::Unit::TestCase
   end
 
   def test_dates
-    (all_test_tiffs - [f('weird_date.exif'), f('plain.tif'), f('endless-loop.exif')]).each do |fname|
+    (all_test_tiffs - [f('weird_date.exif'), f('plain.tif'), f('endless-loop.exif'), f('truncated.exif')]).each do |fname|
       assert_kind_of Time, TIFF.new(fname).date_time
     end
     assert_nil TIFF.new(f('weird_date.exif')).date_time
+  end
+
+  def test_time_with_zone
+    old_proc = TIFF.mktime_proc
+    TIFF.mktime_proc = proc { |*args| "TIME-WITH-ZONE" }
+    assert_equal "TIME-WITH-ZONE", TIFF.new(f('nikon_d1x.tif')).date_time
+  ensure
+    TIFF.mktime_proc = old_proc
   end
 
   def test_orientation
@@ -80,6 +84,16 @@ class TIFFTest < Test::Unit::TestCase
           TIFF::RightBottomOrientation,
           TIFF::LeftBottomOrientation
         ].any? { |c| orientation == c }, 'not an orientation'
+        assert [
+          :TopLeft,
+          :TopRight,
+          :BottomRight,
+          :BottomLeft,
+          :LeftTop,
+          :RightTop,
+          :RightBottom,
+          :LeftBottom
+        ].any? { |c| orientation.to_sym == c }, 'not an orientation symbol'
         assert orientation.respond_to?(:to_i)
         assert orientation.respond_to?(:transform_rmagick)
         tested += 1
@@ -98,30 +112,37 @@ class TIFFTest < Test::Unit::TestCase
     assert_equal('WGS84', t.gps_map_datum)
     assert_equal(54, t.gps.latitude.round)
     assert_equal(-7, t.gps.longitude.round)
+    assert_nil(t.gps.altitude)
 
     (all_test_exifs - %w(gps user-comment out-of-range negative-exposure-bias-value).map{|v| f("#{v}.exif")}).each do |fname|
       assert_nil TIFF.new(fname).gps_version_id
     end
   end
 
+  def test_bad_gps
+    assert_nil TIFF.new(f('bad_gps.exif')).gps
+  end
+
+  def test_lens_model
+    t = TIFF.new(f('sony-a7ii.exif'))
+    assert_equal('FE 16-35mm F4 ZA OSS', t.lens_model)
+  end
+
   def test_ifd_dispatch
     assert @t.respond_to?(:f_number)
-    assert @t.respond_to?('f_number')
-    assert @t.methods.include?('f_number')
-    assert TIFF.instance_methods.include?('f_number')
+    assert @t.methods.include?(:f_number)
+    assert TIFF.instance_methods.include?(:f_number)
 
-    assert_not_nil @t.f_number
+    assert @t.f_number
     assert_kind_of Rational, @t.f_number
-    assert_not_nil @t[0].f_number
+    assert @t[0].f_number
     assert_kind_of Rational, @t[0].f_number
   end
 
   def test_avoid_dispatch_to_nonexistent_ifds
-    assert_nothing_raised do
-      all_test_tiffs.each do |fname|
-        t = TIFF.new(fname)
-        TIFF::TAGS.each { |tag| t.send(tag) }
-      end
+    all_test_tiffs.each do |fname|
+      assert t = TIFF.new(fname)
+      assert TIFF::TAGS.map { |tag| t.send(tag) }
     end
   end
 
@@ -135,9 +156,7 @@ class TIFFTest < Test::Unit::TestCase
   end
 
   def test_old_style
-    assert_nothing_raised do
-      assert_not_nil @t[:f_number]
-    end
+    assert @t[:f_number]
   end
 
   def test_yaml_dump_and_load
@@ -155,10 +174,8 @@ class TIFFTest < Test::Unit::TestCase
     all_test_tiffs.each do |fname|
       t = TIFF.new(fname)
       unless t.jpeg_thumbnails.empty?
-        assert_nothing_raised do
-          t.jpeg_thumbnails.each do |n|
-            JPEG.new(StringIO.new(n))
-          end
+        t.jpeg_thumbnails.each do |n|
+          assert JPEG.new(StringIO.new(n))
         end
         count += 1
       end
@@ -171,17 +188,31 @@ class TIFFTest < Test::Unit::TestCase
     assert true
   end
 
+  def test_should_read_truncated
+    TIFF.new(f('truncated.exif'))
+    assert true
+  end
+
   def test_user_comment
     assert_equal("Manassas Battlefield", TIFF.new(f('user-comment.exif')).user_comment)
   end
 
   def test_handle_out_of_range_offset
-    assert_nothing_raised do
-      assert 'NIKON', TIFF.new(f('out-of-range.exif')).make
-    end
+    assert_equal 'NIKON', TIFF.new(f('out-of-range.exif')).make
   end
-  
+
   def test_negative_exposure_bias_value
     assert_equal(-1.quo(3), TIFF.new(f('negative-exposure-bias-value.exif')).exposure_bias_value)
+  end
+
+  def test_nul_terminated_strings
+    assert_equal 'GoPro', TIFF.new(f('gopro_hd2.exif')).make
+  end
+
+  def test_methods_method
+    t = TIFF.new(f('gopro_hd2.exif'))
+    assert t.methods.include?(:make)
+    assert t.methods(true).include?(:make)
+    assert ! t.methods(false).include?(:make)
   end
 end
